@@ -8,7 +8,7 @@
   },
   "vars": {
     "OPENROUTER_MODEL": "openai/gpt-oss-120b:free",
-    "APP_VERSION_CODE": "6",
+    "APP_VERSION_CODE": "2006",
     "APP_VERSION_NAME": "0.1.5",
     "APP_RELEASE_NOTES": "Adds one-tap script copy while keeping the small release APK and update progress flow.",
     "APP_APK_KEY": "app/dhanda-ai.apk",
