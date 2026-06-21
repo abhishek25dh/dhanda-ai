@@ -39,9 +39,16 @@ const forceRewrite = process.env.FORCE_REWRITE === '1';
 
 await mkdir(runDir, { recursive: true });
 
+const readyVideoIds = await fetchReadyVideoIds();
+
 for (const channel of channels) {
   const videos = await latestVideos(channel);
   for (const video of videos.filter((item) => shouldProcess(channel, item))) {
+    if (!forceRewrite && readyVideoIds.has(video.id)) {
+      console.log(`skipped ${video.id}; server already has a ready script`);
+      continue;
+    }
+
     const outputPath = join(runDir, `${video.id}.json`);
     if (await fileExists(outputPath)) {
       const payload = await ensureRewrite(
@@ -75,6 +82,30 @@ for (const channel of channels) {
     }
 
     console.log(`processed ${video.id} via ${transcript.source}`);
+  }
+}
+
+async function fetchReadyVideoIds() {
+  if (!apiBase) {
+    return new Set();
+  }
+
+  try {
+    const response = await fetch(`${apiBase.replace(/\/$/, '')}/scripts/latest`);
+    if (!response.ok) {
+      console.warn(`Could not check existing server scripts: ${response.status}`);
+      return new Set();
+    }
+    const data = await response.json();
+    return new Set(
+      (data.items ?? [])
+        .filter((item) => item.status === 'ready')
+        .map((item) => item.id),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Could not check existing server scripts: ${message}`);
+    return new Set();
   }
 }
 
