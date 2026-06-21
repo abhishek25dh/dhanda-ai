@@ -54,6 +54,18 @@ class ApiClient {
     }
   }
 
+  Future<String> fetchLatestScriptsBody() async {
+    final uri = Uri.parse('$baseUrl/scripts/latest');
+    final request = await HttpClient().getUrl(uri);
+    final response = await request.close().timeout(
+          const Duration(seconds: 12),
+        );
+    if (response.statusCode != 200) {
+      throw HttpException('Unexpected status ${response.statusCode}');
+    }
+    return response.transform(utf8.decoder).join();
+  }
+
   Future<AppUpdateInfo?> fetchAppUpdate(int currentVersionCode) async {
     final uri = Uri.parse('$baseUrl/app/latest');
     try {
@@ -152,6 +164,18 @@ class NativeAudioStore {
         .invokeMethod<String>('getCombinedLink', {'videoId': videoId});
   }
 
+  Future<List<UploadedAudioLink>> combinedLinks(String videoId) async {
+    final result = await _channel.invokeMethod<List<dynamic>>(
+      'getCombinedLinks',
+      {'videoId': videoId},
+    );
+    return (result ?? <dynamic>[])
+        .map(
+          (item) => UploadedAudioLink.fromNative(item as Map<dynamic, dynamic>),
+        )
+        .toList();
+  }
+
   Future<RecordingItem> merge(String videoId) async {
     final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
       'mergeRecordings',
@@ -208,6 +232,26 @@ class NativeAudioStore {
 
   Future<void> installApk(String url) {
     return _channel.invokeMethod('installApk', {'url': url});
+  }
+
+  Future<String> updateApkPath(int versionCode) async {
+    return await _channel.invokeMethod<String>(
+          'updateApkPath',
+          {'versionCode': versionCode},
+        ) ??
+        '';
+  }
+
+  Future<void> openApk(String path) {
+    return _channel.invokeMethod('openApk', {'path': path});
+  }
+
+  Future<String?> cachedScriptsJson() {
+    return _channel.invokeMethod<String>('getCachedScripts');
+  }
+
+  Future<void> cacheScriptsJson(String json) {
+    return _channel.invokeMethod('saveCachedScripts', {'json': json});
   }
 
   Future<List<RecordingItem>> list(String videoId) async {
@@ -274,6 +318,25 @@ class AppUpdateInfo {
   final String releaseNotes;
 }
 
+class UploadedAudioLink {
+  const UploadedAudioLink({
+    required this.url,
+    required this.createdAt,
+  });
+
+  factory UploadedAudioLink.fromNative(Map<dynamic, dynamic> native) {
+    return UploadedAudioLink(
+      url: native['url'] as String? ?? '',
+      createdAt: DateTime.fromMillisecondsSinceEpoch(
+        native['createdAt'] as int? ?? DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
+  }
+
+  final String url;
+  final DateTime createdAt;
+}
+
 class RecordingItem {
   const RecordingItem({
     required this.id,
@@ -314,45 +377,176 @@ class ScriptFeedPage extends StatefulWidget {
 class _ScriptFeedPageState extends State<ScriptFeedPage> {
   final ApiClient _api = ApiClient();
   final NativeAudioStore _native = NativeAudioStore();
-  late Future<List<VideoScript>> _scripts;
-  Future<AppUpdateInfo?>? _update;
+  List<VideoScript> _scripts = <VideoScript>[];
+  AppUpdateInfo? _update;
+  String? _downloadedUpdatePath;
+  bool _loadingInitialCache = true;
+  bool _refreshingScripts = false;
   bool _installingUpdate = false;
+  bool _downloadingUpdate = false;
+  double? _updateProgress;
 
   @override
   void initState() {
     super.initState();
-    _scripts = _api.fetchLatestScripts();
+    _loadCachedScripts();
+    _refresh(showFullScreenFallback: false);
     _checkForUpdate();
   }
 
   Future<void> _checkForUpdate() async {
     final currentVersion = await _native.versionCode();
+    final update = await _api.fetchAppUpdate(currentVersion);
+    String? downloadedPath;
+    if (update != null) {
+      final path = await _native.updateApkPath(update.versionCode);
+      if (path.isNotEmpty && await File(path).exists()) {
+        downloadedPath = path;
+      }
+    }
     if (!mounted) {
       return;
     }
     setState(() {
-      _update = _api.fetchAppUpdate(currentVersion);
+      _update = update;
+      _downloadedUpdatePath = downloadedPath;
+      _downloadingUpdate = false;
+      _updateProgress = null;
     });
   }
 
-  Future<void> _refresh() async {
+  Future<void> _loadCachedScripts() async {
+    final cached = await _native.cachedScriptsJson();
+    if (!mounted) {
+      return;
+    }
+    if (cached == null || cached.isEmpty) {
+      setState(() {
+        _scripts = sampleScripts;
+        _loadingInitialCache = false;
+      });
+      return;
+    }
+    try {
+      setState(() {
+        _scripts = _scriptsFromBody(cached);
+        _loadingInitialCache = false;
+      });
+    } catch (_) {
+      setState(() {
+        _scripts = sampleScripts;
+        _loadingInitialCache = false;
+      });
+    }
+  }
+
+  Future<void> _refresh({bool showFullScreenFallback = true}) async {
+    if (_refreshingScripts) {
+      return;
+    }
     setState(() {
-      _scripts = _api.fetchLatestScripts();
+      _refreshingScripts = true;
+      if (showFullScreenFallback && _scripts.isEmpty) {
+        _loadingInitialCache = true;
+      }
     });
+    try {
+      final body = await _api.fetchLatestScriptsBody();
+      final scripts = _scriptsFromBody(body);
+      await _native.cacheScriptsJson(body);
+      if (mounted) {
+        setState(() {
+          _scripts = scripts;
+        });
+      }
+    } catch (_) {
+      if (mounted && _scripts.isEmpty) {
+        setState(() {
+          _scripts = sampleScripts;
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _refreshingScripts = false;
+          _loadingInitialCache = false;
+        });
+      }
+    }
     await _checkForUpdate();
-    await _scripts;
   }
 
-  Future<void> _installUpdate(AppUpdateInfo update) async {
+  List<VideoScript> _scriptsFromBody(String body) {
+    final decoded = jsonDecode(body) as Map<String, dynamic>;
+    final items = decoded['items'] as List<dynamic>? ?? <dynamic>[];
+    return items
+        .map((item) => VideoScript.fromJson(item as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<void> _downloadUpdate(AppUpdateInfo update) async {
+    setState(() {
+      _downloadingUpdate = true;
+      _updateProgress = 0;
+    });
+    try {
+      final path = await _native.updateApkPath(update.versionCode);
+      final file = File(path);
+      await file.parent.create(recursive: true);
+      final request = await HttpClient().getUrl(Uri.parse(update.apkUrl));
+      final response =
+          await request.close().timeout(const Duration(minutes: 4));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException('Download failed: ${response.statusCode}');
+      }
+      final total = response.contentLength;
+      var received = 0;
+      final sink = file.openWrite();
+      await for (final chunk in response) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (mounted && total > 0) {
+          setState(() {
+            _updateProgress = received / total;
+          });
+        }
+      }
+      await sink.close();
+      if (mounted) {
+        setState(() {
+          _downloadedUpdatePath = path;
+          _updateProgress = 1;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Update download failed: $error')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _downloadingUpdate = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _installUpdate() async {
+    final path = _downloadedUpdatePath;
+    if (path == null || path.isEmpty) {
+      return;
+    }
     setState(() {
       _installingUpdate = true;
     });
     try {
-      await _native.installApk(update.apkUrl);
+      await _native.openApk(path);
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Update could not start: $error')),
+          SnackBar(content: Text('Update could not install: $error')),
         );
       }
     } finally {
@@ -379,50 +573,45 @@ class _ScriptFeedPageState extends State<ScriptFeedPage> {
         actions: [
           IconButton(
             tooltip: 'Refresh',
-            onPressed: _refresh,
+            onPressed: () => _refresh(),
             icon: const Icon(Icons.refresh_rounded),
           ),
         ],
       ),
-      body: FutureBuilder<List<VideoScript>>(
-        future: _scripts,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          final scripts = snapshot.data ?? sampleScripts;
-          final sections = FeedSection.fromScripts(scripts);
-          return RefreshIndicator(
-            onRefresh: _refresh,
-            child: ListView.builder(
-              padding: const EdgeInsets.fromLTRB(14, 10, 14, 24),
-              itemCount: sections.length + 1,
-              itemBuilder: (context, index) {
-                if (index == 0) {
-                  return FutureBuilder<AppUpdateInfo?>(
-                    future: _update,
-                    builder: (context, updateSnapshot) {
-                      final update = updateSnapshot.data;
-                      if (update == null) {
-                        return const SizedBox.shrink();
-                      }
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: _UpdateBanner(
-                          update: update,
-                          installing: _installingUpdate,
-                          onInstall: () => _installUpdate(update),
-                        ),
-                      );
-                    },
-                  );
-                }
-                return DateSectionView(section: sections[index - 1]);
-              },
+      body: _loadingInitialCache && _scripts.isEmpty
+          ? const _WarmStartLoading()
+          : RefreshIndicator(
+              onRefresh: () => _refresh(),
+              child: ListView.builder(
+                padding: const EdgeInsets.fromLTRB(14, 10, 14, 24),
+                itemCount: FeedSection.fromScripts(_scripts).length + 2,
+                itemBuilder: (context, index) {
+                  final sections = FeedSection.fromScripts(_scripts);
+                  if (index == 0) {
+                    return _RefreshStatusBanner(refreshing: _refreshingScripts);
+                  }
+                  if (index == 1) {
+                    final update = _update;
+                    if (update == null) {
+                      return const SizedBox.shrink();
+                    }
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: _UpdateBanner(
+                        update: update,
+                        downloaded: _downloadedUpdatePath != null,
+                        downloading: _downloadingUpdate,
+                        installing: _installingUpdate,
+                        progress: _updateProgress,
+                        onDownload: () => _downloadUpdate(update),
+                        onInstall: _installUpdate,
+                      ),
+                    );
+                  }
+                  return DateSectionView(section: sections[index - 2]);
+                },
+              ),
             ),
-          );
-        },
-      ),
     );
   }
 }
@@ -430,12 +619,20 @@ class _ScriptFeedPageState extends State<ScriptFeedPage> {
 class _UpdateBanner extends StatelessWidget {
   const _UpdateBanner({
     required this.update,
+    required this.downloaded,
+    required this.downloading,
     required this.installing,
+    required this.progress,
+    required this.onDownload,
     required this.onInstall,
   });
 
   final AppUpdateInfo update;
+  final bool downloaded;
+  final bool downloading;
   final bool installing;
+  final double? progress;
+  final VoidCallback onDownload;
   final VoidCallback onInstall;
 
   @override
@@ -456,7 +653,18 @@ class _UpdateBanner extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const _LogoMark(size: 44),
+          Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: const Color(0xff12b65d),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: const Icon(
+              Icons.system_update_alt_rounded,
+              color: Colors.white,
+            ),
+          ),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
@@ -488,19 +696,45 @@ class _UpdateBanner extends StatelessWidget {
                         ),
                   ),
                 ],
+                if (downloading) ...[
+                  const SizedBox(height: 10),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(999),
+                    child: LinearProgressIndicator(
+                      minHeight: 7,
+                      value: progress,
+                      color: const Color(0xff12b65d),
+                      backgroundColor: const Color(0xff24554d),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    progress == null
+                        ? 'Downloading update'
+                        : 'Downloading ${(progress! * 100).round()}%',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: const Color(0xffd7eee7),
+                          fontWeight: FontWeight.w800,
+                        ),
+                  ),
+                ],
               ],
             ),
           ),
           const SizedBox(width: 10),
           FilledButton.icon(
-            onPressed: installing ? null : onInstall,
+            onPressed: downloading || installing
+                ? null
+                : downloaded
+                    ? onInstall
+                    : onDownload,
             style: FilledButton.styleFrom(
               backgroundColor: const Color(0xff12b65d),
               foregroundColor: Colors.white,
               disabledBackgroundColor: const Color(0xffdfe6df),
               padding: const EdgeInsets.symmetric(horizontal: 12),
             ),
-            icon: installing
+            icon: downloading || installing
                 ? const SizedBox.square(
                     dimension: 16,
                     child: CircularProgressIndicator(
@@ -508,10 +742,121 @@ class _UpdateBanner extends StatelessWidget {
                       color: Color(0xff0e6656),
                     ),
                   )
-                : const Icon(Icons.system_update_alt_rounded, size: 18),
-            label: Text(installing ? 'Wait' : 'Update'),
+                : Icon(
+                    downloaded
+                        ? Icons.install_mobile_rounded
+                        : Icons.download_rounded,
+                    size: 18,
+                  ),
+            label: Text(
+              downloading
+                  ? 'Wait'
+                  : installing
+                      ? 'Wait'
+                      : downloaded
+                          ? 'Install'
+                          : 'Download',
+            ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _RefreshStatusBanner extends StatelessWidget {
+  const _RefreshStatusBanner({required this.refreshing});
+
+  final bool refreshing;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!refreshing) {
+      return const SizedBox.shrink();
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xffdfe6df)),
+      ),
+      child: Row(
+        children: [
+          const SizedBox.square(
+            dimension: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Checking for new videos',
+              style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    color: const Color(0xff0e6656),
+                    fontWeight: FontWeight.w900,
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WarmStartLoading extends StatelessWidget {
+  const _WarmStartLoading();
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 24),
+      children: const [
+        _FeedSkeletonCard(),
+        SizedBox(height: 12),
+        _FeedSkeletonCard(),
+      ],
+    );
+  }
+}
+
+class _FeedSkeletonCard extends StatefulWidget {
+  const _FeedSkeletonCard();
+
+  @override
+  State<_FeedSkeletonCard> createState() => _FeedSkeletonCardState();
+}
+
+class _FeedSkeletonCardState extends State<_FeedSkeletonCard>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: Tween<double>(begin: 0.45, end: 1).animate(_controller),
+      child: Container(
+        height: 150,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xffdfe6df)),
+        ),
       ),
     );
   }
@@ -845,7 +1190,7 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
   double? _uploadProgress;
   String? _uploadStage;
   int _lastUploadNotificationProgress = -1;
-  String? _combinedLink;
+  List<UploadedAudioLink> _combinedLinks = <UploadedAudioLink>[];
   final Stopwatch _recordingWatch = Stopwatch();
   Timer? _recordingTicker;
   Duration _recordingElapsed = Duration.zero;
@@ -865,13 +1210,13 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
 
   Future<void> _loadRecordings() async {
     final items = await _audio.list(widget.script.id);
-    final link = await _audio.combinedLink(widget.script.id);
+    final links = await _audio.combinedLinks(widget.script.id);
     if (!mounted) {
       return;
     }
     setState(() {
       _recordings = items;
-      _combinedLink = link;
+      _combinedLinks = links;
       _loading = false;
     });
   }
@@ -1063,24 +1408,6 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
     final canAddRecording = !_recording && _pending == null;
     return Scaffold(
       backgroundColor: const Color(0xfff7f8f4),
-      appBar: AppBar(
-        titleSpacing: 0,
-        backgroundColor: const Color(0xfff7f8f4),
-        surfaceTintColor: Colors.transparent,
-        title: Row(
-          children: [
-            const _LogoMark(size: 34),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                widget.script.channelName,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ],
-        ),
-      ),
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
@@ -1097,7 +1424,10 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _DetailHero(script: widget.script),
+                    _DetailHero(
+                      script: widget.script,
+                      onBack: () => Navigator.of(context).pop(),
+                    ),
                     const SizedBox(height: 12),
                     SizedBox(
                       height: scriptHeight,
@@ -1128,17 +1458,18 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
                         onDiscard: _discardPending,
                       ),
                     ),
-                    if (_recordings.isNotEmpty || _combinedLink != null) ...[
+                    if (_recordings.isNotEmpty ||
+                        _combinedLinks.isNotEmpty) ...[
                       const SizedBox(height: 12),
                       CombinedUploadPanel(
-                        link: _combinedLink,
+                        links: _combinedLinks,
+                        canUpload: _recordings.isNotEmpty,
                         busy: _uploadingCombined,
                         progress: _uploadProgress,
                         stage: _uploadStage,
                         onUpload: _uploadCombined,
-                        onShare: _combinedLink == null
-                            ? null
-                            : () => _audio.share(_shareMessage(_combinedLink!)),
+                        onShare: (link) =>
+                            _audio.share(_shareMessage(link.url)),
                       ),
                     ],
                     const SizedBox(height: 14),
@@ -1177,20 +1508,22 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
 }
 
 class _DetailHero extends StatelessWidget {
-  const _DetailHero({required this.script});
+  const _DetailHero({required this.script, required this.onBack});
 
   final VideoScript script;
+  final VoidCallback onBack;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.fromLTRB(8, 10, 14, 14),
       decoration: BoxDecoration(
-        color: const Color(0xff042f28),
+        color: Colors.white,
         borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xffdfe6df)),
         boxShadow: const [
           BoxShadow(
-            color: Color(0x1f042f28),
+            color: Color(0x0f042f28),
             blurRadius: 18,
             offset: Offset(0, 8),
           ),
@@ -1199,18 +1532,36 @@ class _DetailHero extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const _LogoMark(size: 52),
-          const SizedBox(width: 12),
+          IconButton(
+            tooltip: 'Back',
+            onPressed: onBack,
+            style: IconButton.styleFrom(
+              backgroundColor: const Color(0xffedf8f3),
+              foregroundColor: const Color(0xff0e6656),
+            ),
+            icon: const Icon(Icons.arrow_back_rounded),
+          ),
+          const SizedBox(width: 6),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
+                  script.channelName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        color: const Color(0xff0e6656),
+                        fontWeight: FontWeight.w900,
+                      ),
+                ),
+                const SizedBox(height: 5),
+                Text(
                   script.title,
                   maxLines: 3,
                   overflow: TextOverflow.ellipsis,
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        color: Colors.white,
+                        color: const Color(0xff052f28),
                         fontWeight: FontWeight.w900,
                         height: 1.16,
                       ),
@@ -1220,7 +1571,7 @@ class _DetailHero extends StatelessWidget {
                   children: [
                     const Icon(
                       Icons.play_circle_outline_rounded,
-                      color: Color(0xff59e38b),
+                      color: Color(0xff12b65d),
                       size: 18,
                     ),
                     const SizedBox(width: 6),
@@ -1230,7 +1581,7 @@ class _DetailHero extends StatelessWidget {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: const Color(0xffd7eee7),
+                              color: const Color(0xff64746e),
                               fontWeight: FontWeight.w600,
                             ),
                       ),
@@ -1734,7 +2085,8 @@ class RecordingTile extends StatelessWidget {
 
 class CombinedUploadPanel extends StatelessWidget {
   const CombinedUploadPanel({
-    required this.link,
+    required this.links,
+    required this.canUpload,
     required this.busy,
     required this.progress,
     required this.stage,
@@ -1743,12 +2095,13 @@ class CombinedUploadPanel extends StatelessWidget {
     super.key,
   });
 
-  final String? link;
+  final List<UploadedAudioLink> links;
+  final bool canUpload;
   final bool busy;
   final double? progress;
   final String? stage;
   final VoidCallback onUpload;
-  final VoidCallback? onShare;
+  final ValueChanged<UploadedAudioLink> onShare;
 
   @override
   Widget build(BuildContext context) {
@@ -1781,34 +2134,33 @@ class CombinedUploadPanel extends StatelessWidget {
                   ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
                 ),
               ),
-              IconButton(
-                tooltip: link == null ? 'Upload stitched audio' : 'Share link',
-                onPressed: busy ? null : (link == null ? onUpload : onShare),
-                style: IconButton.styleFrom(
+              FilledButton.icon(
+                onPressed: busy || !canUpload ? null : onUpload,
+                style: FilledButton.styleFrom(
                   backgroundColor: const Color(0xff042f28),
                   foregroundColor: Colors.white,
                   disabledBackgroundColor: const Color(0xffdfe6df),
                   disabledForegroundColor: const Color(0xff6c7770),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
                 ),
                 icon: busy
                     ? const SizedBox.square(
-                        dimension: 20,
+                        dimension: 16,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
                           color: Color(0xff0e6656),
                         ),
                       )
-                    : Icon(
-                        link == null
-                            ? Icons.cloud_upload_outlined
-                            : Icons.share_rounded,
-                      ),
+                    : const Icon(Icons.cloud_upload_outlined, size: 18),
+                label: Text(busy ? 'Wait' : 'Upload'),
               ),
             ],
           ),
           const SizedBox(height: 6),
           Text(
-            'Parts are joined in the order you recorded them.',
+            canUpload
+                ? 'Current saved parts will be stitched into a new audio URL.'
+                : 'Record new parts to create another audio URL.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
           if (busy) ...[
@@ -1832,15 +2184,96 @@ class CombinedUploadPanel extends StatelessWidget {
                   ),
             ),
           ],
-          if (link != null) ...[
-            const SizedBox(height: 8),
-            SelectableText(
-              link!,
-              style: Theme.of(
-                context,
-              ).textTheme.bodySmall?.copyWith(color: const Color(0xff0e6656)),
+          if (links.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Text(
+              'Uploaded links',
+              style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    color: const Color(0xff052f28),
+                    fontWeight: FontWeight.w900,
+                  ),
             ),
+            const SizedBox(height: 8),
+            for (var index = 0; index < links.length; index += 1)
+              _UploadedLinkTile(
+                link: links[index],
+                label: 'Audio ${links.length - index}',
+                onShare: () => onShare(links[index]),
+              ),
           ],
+        ],
+      ),
+    );
+  }
+}
+
+class _UploadedLinkTile extends StatelessWidget {
+  const _UploadedLinkTile({
+    required this.link,
+    required this.label,
+    required this.onShare,
+  });
+
+  final UploadedAudioLink link;
+  final String label;
+  final VoidCallback onShare;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(10, 9, 6, 9),
+      decoration: BoxDecoration(
+        color: const Color(0xfff7f8f4),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xffdfe6df)),
+      ),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.link_rounded,
+            color: Color(0xff0e6656),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        fontWeight: FontWeight.w900,
+                        color: const Color(0xff052f28),
+                      ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _formatDateTime(link.createdAt),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: const Color(0xff64746e),
+                      ),
+                ),
+                const SizedBox(height: 2),
+                SelectableText(
+                  link.url,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: const Color(0xff0e6656),
+                      ),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Share this link',
+            onPressed: onShare,
+            style: IconButton.styleFrom(
+              backgroundColor: const Color(0xff042f28),
+              foregroundColor: Colors.white,
+            ),
+            icon: const Icon(Icons.share_rounded),
+          ),
         ],
       ),
     );

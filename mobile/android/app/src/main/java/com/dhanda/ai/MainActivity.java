@@ -20,6 +20,7 @@ import android.media.MediaRecorder;
 import android.os.Build;
 import android.provider.Settings;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -34,7 +35,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
@@ -49,6 +49,7 @@ public class MainActivity extends FlutterActivity {
     private static final String PREFS = "dhanda_ai_recordings";
     private static final String LINKS_KEY = "recording_links";
     private static final String COMBINED_LINKS_KEY = "combined_links";
+    private static final String SCRIPT_CACHE_KEY = "script_cache";
     private static final int RECORD_AUDIO_REQUEST = 1207;
     private static final int NOTIFICATION_REQUEST = 1208;
     private static final String UPLOAD_CHANNEL_ID = "dhanda_ai_uploads";
@@ -118,6 +119,9 @@ public class MainActivity extends FlutterActivity {
                 case "getCombinedLink":
                     getCombinedLink(call.argument("videoId"), result);
                     break;
+                case "getCombinedLinks":
+                    getCombinedLinks(call.argument("videoId"), result);
+                    break;
                 case "shareText":
                     shareText(call.argument("text"), result);
                     break;
@@ -126,6 +130,18 @@ public class MainActivity extends FlutterActivity {
                     break;
                 case "installApk":
                     installApk(call.argument("url"), result);
+                    break;
+                case "updateApkPath":
+                    updateApkPath(call.argument("versionCode"), result);
+                    break;
+                case "openApk":
+                    openApk(call.argument("path"), result);
+                    break;
+                case "getCachedScripts":
+                    getCachedScripts(result);
+                    break;
+                case "saveCachedScripts":
+                    saveCachedScripts(call.argument("json"), result);
                     break;
                 case "showUploadStarted":
                     showUploadStarted(call.argument("title"), result);
@@ -325,7 +341,13 @@ public class MainActivity extends FlutterActivity {
         }
         JSONObject links = readCombinedLinks();
         try {
-            links.put(sanitize(videoId), url);
+            String key = sanitize(videoId);
+            JSONArray history = combinedHistoryFor(links, key);
+            JSONObject item = new JSONObject();
+            item.put("url", url);
+            item.put("createdAt", System.currentTimeMillis());
+            history.put(item);
+            links.put(key, history);
             prefs().edit().putString(COMBINED_LINKS_KEY, links.toString()).apply();
             result.success(null);
         } catch (JSONException error) {
@@ -338,8 +360,36 @@ public class MainActivity extends FlutterActivity {
             result.success(null);
             return;
         }
-        String link = readCombinedLinks().optString(sanitize(videoId), null);
+        JSONArray history = combinedHistoryFor(readCombinedLinks(), sanitize(videoId));
+        JSONObject latest = history.length() == 0
+                ? null
+                : history.optJSONObject(history.length() - 1);
+        String link = latest == null ? null : latest.optString("url", null);
         result.success(link == null || link.isEmpty() ? null : link);
+    }
+
+    private void getCombinedLinks(String videoId, MethodChannel.Result result) {
+        if (videoId == null) {
+            result.success(new ArrayList<>());
+            return;
+        }
+        JSONArray history = combinedHistoryFor(readCombinedLinks(), sanitize(videoId));
+        List<Map<String, Object>> items = new ArrayList<>();
+        for (int index = history.length() - 1; index >= 0; index--) {
+            JSONObject item = history.optJSONObject(index);
+            if (item == null) {
+                continue;
+            }
+            String url = item.optString("url", "");
+            if (url.isEmpty()) {
+                continue;
+            }
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("url", url);
+            payload.put("createdAt", item.optLong("createdAt", System.currentTimeMillis()));
+            items.add(payload);
+        }
+        result.success(items);
     }
 
     private void shareText(String text, MethodChannel.Result result) {
@@ -412,6 +462,57 @@ public class MainActivity extends FlutterActivity {
                 );
             }
         }).start();
+    }
+
+    private void updateApkPath(Integer versionCode, MethodChannel.Result result) {
+        File updateFolder = new File(getCacheDir(), "updates");
+        if (!updateFolder.exists()) {
+            updateFolder.mkdirs();
+        }
+        int cleanVersion = versionCode == null ? 0 : versionCode;
+        File apk = new File(updateFolder, "dhanda-ai-v" + cleanVersion + ".apk");
+        result.success(apk.getAbsolutePath());
+    }
+
+    private void openApk(String path, MethodChannel.Result result) {
+        if (path == null || path.trim().isEmpty()) {
+            result.error("BAD_APK_PATH", "APK path is required.", null);
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && !getPackageManager().canRequestPackageInstalls()) {
+            Intent settings = new Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + getPackageName())
+            );
+            startActivity(settings);
+            result.error(
+                    "INSTALL_PERMISSION_REQUIRED",
+                    "Allow Dhanda AI to install unknown apps, then tap Install again.",
+                    null
+            );
+            return;
+        }
+        File apk = new File(path);
+        if (!apk.exists()) {
+            result.error("APK_MISSING", "Downloaded update APK was not found.", null);
+            return;
+        }
+        openApkInstaller(apk);
+        result.success(null);
+    }
+
+    private void getCachedScripts(MethodChannel.Result result) {
+        result.success(prefs().getString(SCRIPT_CACHE_KEY, null));
+    }
+
+    private void saveCachedScripts(String json, MethodChannel.Result result) {
+        if (json == null || json.trim().isEmpty()) {
+            result.success(null);
+            return;
+        }
+        prefs().edit().putString(SCRIPT_CACHE_KEY, json).apply();
+        result.success(null);
     }
 
     private void downloadFile(String sourceUrl, File destination) throws IOException {
@@ -582,17 +683,32 @@ public class MainActivity extends FlutterActivity {
 
     private JSONObject readJson(String raw) {
         try {
-            JSONObject compact = new JSONObject();
-            JSONObject saved = new JSONObject(raw);
-            Iterator<String> keys = saved.keys();
-            while (keys.hasNext()) {
-                String key = keys.next();
-                compact.put(key, saved.optString(key));
-            }
-            return compact;
+            return new JSONObject(raw);
         } catch (JSONException error) {
             return new JSONObject();
         }
+    }
+
+    private JSONArray combinedHistoryFor(JSONObject links, String key) {
+        Object existing = links.opt(key);
+        if (existing instanceof JSONArray) {
+            return (JSONArray) existing;
+        }
+        JSONArray history = new JSONArray();
+        if (existing instanceof String) {
+            String url = (String) existing;
+            if (!url.isEmpty()) {
+                JSONObject item = new JSONObject();
+                try {
+                    item.put("url", url);
+                    item.put("createdAt", System.currentTimeMillis());
+                    history.put(item);
+                } catch (JSONException ignored) {
+                    // Ignore malformed legacy values.
+                }
+            }
+        }
+        return history;
     }
 
     private void muxAudioFiles(File[] files, File output) throws IOException {
