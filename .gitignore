@@ -1,0 +1,16 @@
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata
+build/
+mobile/build/
+mobile/.dart_tool/
+mobile/android/.gradle/
+mobile/android/local.properties
+backend/node_modules/
+backend/dist/
+backend/.wrangler/
+runs/
+*.log
+.env
+.dev.vars

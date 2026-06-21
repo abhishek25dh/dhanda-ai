@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "dhanda-ai-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-21",
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+  "vars": {
+    "OPENROUTER_MODEL": "openai/gpt-oss-120b:free"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "dhanda-ai",
+      "database_id": "ce329529-46a1-4cf3-8a38-b37d9f5adceb"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "AUDIO_BUCKET",
+      "bucket_name": "dhanda-ai-audio"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
