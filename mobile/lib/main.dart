@@ -57,16 +57,26 @@ class ApiClient {
   Future<String> uploadRecording({
     required String videoId,
     required RecordingItem recording,
+    ValueChanged<double>? onProgress,
   }) async {
     final file = File(recording.path);
     final fileName = recording.path.split(Platform.pathSeparator).last;
+    final fileLength = await file.length();
     final uri = Uri.parse(
       '$baseUrl/audio-uploads?videoId=${Uri.encodeComponent(videoId)}&fileName=${Uri.encodeComponent(fileName)}',
     );
     final request = await HttpClient().postUrl(uri);
     request.headers.contentType = ContentType('audio', 'mp4');
     request.headers.set('x-dhanda-recording-id', recording.id);
-    await request.addStream(file.openRead());
+    request.contentLength = fileLength;
+    var uploadedBytes = 0;
+    await for (final chunk in file.openRead()) {
+      request.add(chunk);
+      uploadedBytes += chunk.length;
+      if (fileLength > 0) {
+        onProgress?.call(uploadedBytes / fileLength);
+      }
+    }
     final response = await request.close().timeout(const Duration(minutes: 2));
     final body = await response.transform(utf8.decoder).join();
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -131,8 +141,42 @@ class NativeAudioStore {
     return _channel.invokeMethod('playRecording', {'path': path});
   }
 
-  Future<void> share(String url) {
-    return _channel.invokeMethod('shareText', {'text': url});
+  Future<void> notifyUploadStarted({required String title}) {
+    return _channel.invokeMethod('showUploadStarted', {'title': title});
+  }
+
+  Future<void> notifyUploadProgress({
+    required String title,
+    required int progress,
+  }) {
+    return _channel.invokeMethod('showUploadProgress', {
+      'title': title,
+      'progress': progress,
+    });
+  }
+
+  Future<void> notifyUploadFinished({
+    required String title,
+    required String url,
+  }) {
+    return _channel.invokeMethod('showUploadFinished', {
+      'title': title,
+      'url': url,
+    });
+  }
+
+  Future<void> notifyUploadFailed({
+    required String title,
+    required String error,
+  }) {
+    return _channel.invokeMethod('showUploadFailed', {
+      'title': title,
+      'error': error,
+    });
+  }
+
+  Future<void> share(String message) {
+    return _channel.invokeMethod('shareText', {'text': message});
   }
 
   Future<List<RecordingItem>> list(String videoId) async {
@@ -569,6 +613,10 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
   bool _paused = false;
   bool _loading = true;
   bool _uploadingCombined = false;
+  bool _scriptExpanded = false;
+  double? _uploadProgress;
+  String? _uploadStage;
+  int _lastUploadNotificationProgress = -1;
   String? _combinedLink;
 
   @override
@@ -656,15 +704,31 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
     }
     setState(() {
       _uploadingCombined = true;
+      _uploadProgress = 0;
+      _uploadStage = 'Preparing audio';
+      _lastUploadNotificationProgress = -1;
     });
     try {
+      await _audio.notifyUploadStarted(title: widget.script.title);
+      _setUploadProgress('Stitching recordings', 0.08);
       final item = await _audio.merge(widget.script.id);
+      _setUploadProgress('Uploading audio', 0.25, notify: true);
       final link = await _api.uploadRecording(
         videoId: widget.script.id,
         recording: item,
+        onProgress: (progress) {
+          final overall = 0.25 + (progress.clamp(0, 1) * 0.7);
+          _setUploadProgress('Uploading audio', overall, notify: true);
+        },
       );
+      _setUploadProgress('Saving link', 0.96, notify: true);
       await _audio.saveLink(
         videoId: widget.script.id,
+        url: link,
+      );
+      _setUploadProgress('Upload complete', 1, notify: true);
+      await _audio.notifyUploadFinished(
+        title: widget.script.title,
         url: link,
       );
       await _loadRecordings();
@@ -674,6 +738,10 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
         ).showSnackBar(const SnackBar(content: Text('Recording uploaded')));
       }
     } catch (error) {
+      await _audio.notifyUploadFailed(
+        title: widget.script.title,
+        error: error.toString(),
+      );
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -683,8 +751,37 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
       if (mounted) {
         setState(() {
           _uploadingCombined = false;
+          _uploadProgress = null;
+          _uploadStage = null;
         });
       }
+    }
+  }
+
+  void _setUploadProgress(
+    String stage,
+    double progress, {
+    bool notify = false,
+  }) {
+    final cleanProgress = progress.clamp(0, 1).toDouble();
+    if (mounted) {
+      setState(() {
+        _uploadStage = stage;
+        _uploadProgress = cleanProgress;
+      });
+    }
+    if (!notify) {
+      return;
+    }
+    final percent = (cleanProgress * 100).round();
+    if (percent == 100 || percent - _lastUploadNotificationProgress >= 5) {
+      _lastUploadNotificationProgress = percent;
+      unawaited(
+        _audio.notifyUploadProgress(
+          title: widget.script.title,
+          progress: percent,
+        ),
+      );
     }
   }
 
@@ -717,7 +814,15 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
               ),
               const SizedBox(height: 10),
               Expanded(
-                child: _ScriptPanel(script: widget.script.script),
+                child: _ScriptPanel(
+                  script: widget.script.script,
+                  expanded: _scriptExpanded,
+                  onToggleExpanded: () {
+                    setState(() {
+                      _scriptExpanded = !_scriptExpanded;
+                    });
+                  },
+                ),
               ),
               const SizedBox(height: 10),
               _RecordingControls(
@@ -737,35 +842,49 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
                 CombinedUploadPanel(
                   link: _combinedLink,
                   busy: _uploadingCombined,
+                  progress: _uploadProgress,
+                  stage: _uploadStage,
                   onUpload: _uploadCombined,
                   onShare: _combinedLink == null
                       ? null
-                      : () => _audio.share(_combinedLink!),
+                      : () => _audio.share(_shareMessage(_combinedLink!)),
                 ),
               ],
-              const SizedBox(height: 10),
-              Text(
-                'Recordings',
-                style: Theme.of(context)
-                    .textTheme
-                    .titleSmall
-                    ?.copyWith(fontWeight: FontWeight.w800),
-              ),
-              const SizedBox(height: 6),
-              SizedBox(
-                height: 118,
-                child: _RecordingsList(
-                  loading: _loading,
-                  recordings: _recordings,
-                  onPlay: (item) => _audio.play(item.path),
-                  onDelete: _delete,
+              if (!_scriptExpanded) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Recordings',
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleSmall
+                      ?.copyWith(fontWeight: FontWeight.w800),
                 ),
-              ),
+                const SizedBox(height: 4),
+                SizedBox(
+                  height: 94,
+                  child: _RecordingsList(
+                    loading: _loading,
+                    recordings: _recordings,
+                    onPlay: (item) => _audio.play(item.path),
+                    onDelete: _delete,
+                  ),
+                ),
+              ],
             ],
           ),
         ),
       ),
     );
+  }
+
+  String _shareMessage(String audioLink) {
+    return [
+      'Namaste, here is my recorded audio.',
+      '',
+      'Title: ${widget.script.title}',
+      'Original YouTube video: ${widget.script.videoUrl}',
+      'Audio download link: $audioLink',
+    ].join('\n');
   }
 }
 
@@ -805,9 +924,15 @@ class _RecordingsList extends StatelessWidget {
 }
 
 class _ScriptPanel extends StatelessWidget {
-  const _ScriptPanel({required this.script});
+  const _ScriptPanel({
+    required this.script,
+    required this.expanded,
+    required this.onToggleExpanded,
+  });
 
   final String script;
+  final bool expanded;
+  final VoidCallback onToggleExpanded;
 
   @override
   Widget build(BuildContext context) {
@@ -818,16 +943,47 @@ class _ScriptPanel extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: const Color(0xffdedbd2)),
       ),
-      child: Scrollbar(
-        thumbVisibility: true,
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.only(right: 10),
-          child: Text(
-            script,
-            style:
-                Theme.of(context).textTheme.bodyLarge?.copyWith(height: 1.45),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Script',
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleSmall
+                      ?.copyWith(fontWeight: FontWeight.w800),
+                ),
+              ),
+              IconButton(
+                tooltip: expanded ? 'Collapse script' : 'Expand script',
+                onPressed: onToggleExpanded,
+                icon: Icon(
+                  expanded
+                      ? Icons.close_fullscreen_rounded
+                      : Icons.open_in_full_rounded,
+                ),
+              ),
+            ],
           ),
-        ),
+          const SizedBox(height: 4),
+          Expanded(
+            child: Scrollbar(
+              thumbVisibility: true,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.only(right: 10),
+                child: Text(
+                  script,
+                  style: Theme.of(context)
+                      .textTheme
+                      .bodyLarge
+                      ?.copyWith(height: 1.45),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -970,6 +1126,8 @@ class CombinedUploadPanel extends StatelessWidget {
   const CombinedUploadPanel({
     required this.link,
     required this.busy,
+    required this.progress,
+    required this.stage,
     required this.onUpload,
     required this.onShare,
     super.key,
@@ -977,6 +1135,8 @@ class CombinedUploadPanel extends StatelessWidget {
 
   final String? link;
   final bool busy;
+  final double? progress;
+  final String? stage;
   final VoidCallback onUpload;
   final VoidCallback? onShare;
 
@@ -1025,6 +1185,26 @@ class CombinedUploadPanel extends StatelessWidget {
             'Parts are joined in the order you recorded them.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
+          if (busy) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(999),
+              child: LinearProgressIndicator(
+                minHeight: 7,
+                value: progress,
+                backgroundColor: const Color(0xffe7e2d7),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '${stage ?? 'Uploading'}'
+              '${progress == null ? '' : ' ${(progress! * 100).round()}%'}',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: const Color(0xff0e6656),
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+          ],
           if (link != null) ...[
             const SizedBox(height: 8),
             SelectableText(

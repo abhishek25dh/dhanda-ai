@@ -1,6 +1,11 @@
 package com.dhanda.ai;
 
 import android.Manifest;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -37,6 +42,11 @@ public class MainActivity extends FlutterActivity {
     private static final String LINKS_KEY = "recording_links";
     private static final String COMBINED_LINKS_KEY = "combined_links";
     private static final int RECORD_AUDIO_REQUEST = 1207;
+    private static final int NOTIFICATION_REQUEST = 1208;
+    private static final String UPLOAD_CHANNEL_ID = "dhanda_ai_uploads";
+    private static final int UPLOAD_PROGRESS_ID = 2201;
+    private static final int UPLOAD_DONE_ID = 2202;
+    private static final int UPLOAD_FAILED_ID = 2203;
 
     private MediaRecorder recorder;
     private MediaPlayer player;
@@ -48,6 +58,16 @@ public class MainActivity extends FlutterActivity {
         super.configureFlutterEngine(flutterEngine);
         new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), CHANNEL)
                 .setMethodCallHandler(this::handleAudioCall);
+        createUploadNotificationChannel();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        NotificationManager manager =
+                (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        manager.cancel(UPLOAD_DONE_ID);
+        manager.cancel(UPLOAD_FAILED_ID);
     }
 
     private void handleAudioCall(MethodCall call, MethodChannel.Result result) {
@@ -89,6 +109,30 @@ public class MainActivity extends FlutterActivity {
                     break;
                 case "shareText":
                     shareText(call.argument("text"), result);
+                    break;
+                case "showUploadStarted":
+                    showUploadStarted(call.argument("title"), result);
+                    break;
+                case "showUploadProgress":
+                    showUploadProgress(
+                            call.argument("title"),
+                            call.argument("progress"),
+                            result
+                    );
+                    break;
+                case "showUploadFinished":
+                    showUploadFinished(
+                            call.argument("title"),
+                            call.argument("url"),
+                            result
+                    );
+                    break;
+                case "showUploadFailed":
+                    showUploadFailed(
+                            call.argument("title"),
+                            call.argument("error"),
+                            result
+                    );
                     break;
                 default:
                     result.notImplemented();
@@ -281,6 +325,85 @@ public class MainActivity extends FlutterActivity {
         result.success(null);
     }
 
+    private void showUploadStarted(String title, MethodChannel.Result result) {
+        if (!canShowNotifications()) {
+            result.success(null);
+            return;
+        }
+        Notification notification = uploadNotificationBuilder(
+                "Uploading recording",
+                shortTitle(title),
+                true
+        )
+                .setOngoing(true)
+                .setProgress(0, 0, true)
+                .build();
+        notificationManager().notify(UPLOAD_PROGRESS_ID, notification);
+        result.success(null);
+    }
+
+    private void showUploadProgress(
+            String title,
+            Integer progress,
+            MethodChannel.Result result
+    ) {
+        if (!canShowNotifications()) {
+            result.success(null);
+            return;
+        }
+        int cleanProgress = progress == null ? 0 : Math.max(0, Math.min(100, progress));
+        Notification notification = uploadNotificationBuilder(
+                "Uploading recording",
+                shortTitle(title) + " - " + cleanProgress + "%",
+                true
+        )
+                .setOngoing(true)
+                .setProgress(100, cleanProgress, false)
+                .build();
+        notificationManager().notify(UPLOAD_PROGRESS_ID, notification);
+        result.success(null);
+    }
+
+    private void showUploadFinished(String title, String url, MethodChannel.Result result) {
+        notificationManager().cancel(UPLOAD_PROGRESS_ID);
+        if (!canShowNotifications()) {
+            result.success(null);
+            return;
+        }
+        String message = shortTitle(title) + "\n" + (url == null ? "" : url);
+        Notification notification = uploadNotificationBuilder(
+                "Recording uploaded",
+                "Tap to open Dhanda AI",
+                false
+        )
+                .setStyle(new Notification.BigTextStyle().bigText(message))
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .build();
+        notificationManager().notify(UPLOAD_DONE_ID, notification);
+        result.success(null);
+    }
+
+    private void showUploadFailed(String title, String error, MethodChannel.Result result) {
+        notificationManager().cancel(UPLOAD_PROGRESS_ID);
+        if (!canShowNotifications()) {
+            result.success(null);
+            return;
+        }
+        String message = shortTitle(title) + "\n" + (error == null ? "Upload failed" : error);
+        Notification notification = uploadNotificationBuilder(
+                "Upload failed",
+                "Open Dhanda AI and try again",
+                false
+        )
+                .setStyle(new Notification.BigTextStyle().bigText(message))
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .build();
+        notificationManager().notify(UPLOAD_FAILED_ID, notification);
+        result.success(null);
+    }
+
     private Map<String, Object> payloadForFile(String videoId, File file) {
         Map<String, Object> payload = new HashMap<>();
         payload.put("id", videoId + ":" + file.getName());
@@ -406,6 +529,84 @@ public class MainActivity extends FlutterActivity {
 
     private SharedPreferences prefs() {
         return getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    private void createUploadNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return;
+        }
+        NotificationChannel channel = new NotificationChannel(
+                UPLOAD_CHANNEL_ID,
+                "Recording uploads",
+                NotificationManager.IMPORTANCE_DEFAULT
+        );
+        channel.setDescription("Shows Dhanda AI recording upload status.");
+        notificationManager().createNotificationChannel(channel);
+    }
+
+    private boolean canShowNotifications() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return true;
+        }
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
+            return true;
+        }
+        requestPermissions(
+                new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                NOTIFICATION_REQUEST
+        );
+        return false;
+    }
+
+    private Notification.Builder uploadNotificationBuilder(
+            String title,
+            String text,
+            boolean ongoing
+    ) {
+        Intent launchIntent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+        if (launchIntent == null) {
+            launchIntent = new Intent(this, MainActivity.class);
+        }
+        launchIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        PendingIntent pendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                launchIntent,
+                flags
+        );
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(this, UPLOAD_CHANNEL_ID)
+                : new Notification.Builder(this);
+        return builder
+                .setSmallIcon(notificationIcon())
+                .setContentTitle(title)
+                .setContentText(text)
+                .setContentIntent(pendingIntent)
+                .setOngoing(ongoing)
+                .setShowWhen(true)
+                .setWhen(System.currentTimeMillis());
+    }
+
+    private int notificationIcon() {
+        int icon = getApplicationInfo().icon;
+        return icon == 0 ? android.R.drawable.stat_sys_upload : icon;
+    }
+
+    private NotificationManager notificationManager() {
+        return (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+    }
+
+    private String shortTitle(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return "Dhanda AI recording";
+        }
+        String trimmed = value.trim();
+        return trimmed.length() <= 90 ? trimmed : trimmed.substring(0, 87) + "...";
     }
 
     private String sanitize(String value) {
