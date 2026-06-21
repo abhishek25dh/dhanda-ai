@@ -7,7 +7,11 @@
     "crons": ["*/15 * * * *"]
   },
   "vars": {
-    "OPENROUTER_MODEL": "openai/gpt-oss-120b:free"
+    "OPENROUTER_MODEL": "openai/gpt-oss-120b:free",
+    "APP_VERSION_CODE": "2",
+    "APP_VERSION_NAME": "0.1.1",
+    "APP_RELEASE_NOTES": "Cleaner recording screen, visible logo, scrollable recordings, upload progress, and private app updates.",
+    "APP_APK_KEY": "app/dhanda-ai.apk"
   },
   "d1_databases": [
     {

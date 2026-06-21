@@ -5,6 +5,10 @@ interface Env {
   ADMIN_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
   OPENROUTER_MODEL?: string;
+  APP_VERSION_CODE?: string;
+  APP_VERSION_NAME?: string;
+  APP_RELEASE_NOTES?: string;
+  APP_APK_KEY?: string;
 }
 
 type ChannelConfig = {
@@ -59,6 +63,12 @@ export default {
       }
       if (request.method === 'GET' && url.pathname === '/scripts/latest') {
         return getLatestScripts(env);
+      }
+      if (request.method === 'GET' && url.pathname === '/app/latest') {
+        return getLatestApp(env, url);
+      }
+      if (request.method === 'GET' && url.pathname === '/app/apk') {
+        return getAppApk(env);
       }
       if (request.method === 'GET' && url.pathname.startsWith('/audio/')) {
         return getAudio(env, url);
@@ -128,6 +138,34 @@ async function getLatestScripts(env: Env): Promise<Response> {
         'Script is being prepared on the server. Pull to refresh in a little while.',
     })),
   });
+}
+
+async function getLatestApp(env: Env, url: URL): Promise<Response> {
+  const versionCode = Number.parseInt(env.APP_VERSION_CODE ?? '1', 10);
+  return json({
+    platform: 'android',
+    versionCode: Number.isFinite(versionCode) ? versionCode : 1,
+    versionName: env.APP_VERSION_NAME ?? '0.1.0',
+    apkUrl: `${url.origin}/app/apk`,
+    releaseNotes:
+      env.APP_RELEASE_NOTES ??
+      'New Dhanda AI build is available with UI and recording improvements.',
+  });
+}
+
+async function getAppApk(env: Env): Promise<Response> {
+  const objectKey = env.APP_APK_KEY ?? 'app/dhanda-ai.apk';
+  const object = await env.AUDIO_BUCKET.get(objectKey);
+  if (!object) {
+    return json({ error: 'App APK has not been uploaded yet' }, 404);
+  }
+
+  const headers = new Headers(corsHeaders);
+  headers.set('content-type', 'application/vnd.android.package-archive');
+  headers.set('content-disposition', 'attachment; filename="dhanda-ai.apk"');
+  headers.set('cache-control', 'no-store');
+  headers.set('etag', object.httpEtag);
+  return new Response(object.body, { headers });
 }
 
 async function uploadAudio(request: Request, env: Env, url: URL): Promise<Response> {

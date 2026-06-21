@@ -54,6 +54,25 @@ class ApiClient {
     }
   }
 
+  Future<AppUpdateInfo?> fetchAppUpdate(int currentVersionCode) async {
+    final uri = Uri.parse('$baseUrl/app/latest');
+    try {
+      final request = await HttpClient().getUrl(uri);
+      final response = await request.close().timeout(
+            const Duration(seconds: 10),
+          );
+      if (response.statusCode != 200) {
+        return null;
+      }
+      final body = await response.transform(utf8.decoder).join();
+      final decoded = jsonDecode(body) as Map<String, dynamic>;
+      final info = AppUpdateInfo.fromJson(decoded);
+      return info.versionCode > currentVersionCode ? info : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<String> uploadRecording({
     required String videoId,
     required RecordingItem recording,
@@ -183,6 +202,14 @@ class NativeAudioStore {
     return _channel.invokeMethod('shareText', {'text': message});
   }
 
+  Future<int> versionCode() async {
+    return await _channel.invokeMethod<int>('versionCode') ?? 1;
+  }
+
+  Future<void> installApk(String url) {
+    return _channel.invokeMethod('installApk', {'url': url});
+  }
+
   Future<List<RecordingItem>> list(String videoId) async {
     final result = await _channel.invokeMethod<List<dynamic>>(
       'listRecordings',
@@ -224,6 +251,29 @@ class VideoScript {
   final String script;
 }
 
+class AppUpdateInfo {
+  const AppUpdateInfo({
+    required this.versionCode,
+    required this.versionName,
+    required this.apkUrl,
+    required this.releaseNotes,
+  });
+
+  factory AppUpdateInfo.fromJson(Map<String, dynamic> json) {
+    return AppUpdateInfo(
+      versionCode: json['versionCode'] as int? ?? 1,
+      versionName: json['versionName'] as String? ?? '0.1.0',
+      apkUrl: json['apkUrl'] as String? ?? '',
+      releaseNotes: json['releaseNotes'] as String? ?? '',
+    );
+  }
+
+  final int versionCode;
+  final String versionName;
+  final String apkUrl;
+  final String releaseNotes;
+}
+
 class RecordingItem {
   const RecordingItem({
     required this.id,
@@ -263,26 +313,69 @@ class ScriptFeedPage extends StatefulWidget {
 
 class _ScriptFeedPageState extends State<ScriptFeedPage> {
   final ApiClient _api = ApiClient();
+  final NativeAudioStore _native = NativeAudioStore();
   late Future<List<VideoScript>> _scripts;
+  Future<AppUpdateInfo?>? _update;
+  bool _installingUpdate = false;
 
   @override
   void initState() {
     super.initState();
     _scripts = _api.fetchLatestScripts();
+    _checkForUpdate();
+  }
+
+  Future<void> _checkForUpdate() async {
+    final currentVersion = await _native.versionCode();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _update = _api.fetchAppUpdate(currentVersion);
+    });
   }
 
   Future<void> _refresh() async {
     setState(() {
       _scripts = _api.fetchLatestScripts();
     });
+    await _checkForUpdate();
     await _scripts;
+  }
+
+  Future<void> _installUpdate(AppUpdateInfo update) async {
+    setState(() {
+      _installingUpdate = true;
+    });
+    try {
+      await _native.installApk(update.apkUrl);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Update could not start: $error')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _installingUpdate = false;
+        });
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Dhanda AI'),
+        titleSpacing: 16,
+        title: const Row(
+          children: [
+            _LogoMark(size: 34),
+            SizedBox(width: 10),
+            Text('Dhanda AI'),
+          ],
+        ),
         actions: [
           IconButton(
             tooltip: 'Refresh',
@@ -303,13 +396,122 @@ class _ScriptFeedPageState extends State<ScriptFeedPage> {
             onRefresh: _refresh,
             child: ListView.builder(
               padding: const EdgeInsets.fromLTRB(14, 10, 14, 24),
+              itemCount: sections.length + 1,
               itemBuilder: (context, index) {
-                return DateSectionView(section: sections[index]);
+                if (index == 0) {
+                  return FutureBuilder<AppUpdateInfo?>(
+                    future: _update,
+                    builder: (context, updateSnapshot) {
+                      final update = updateSnapshot.data;
+                      if (update == null) {
+                        return const SizedBox.shrink();
+                      }
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: _UpdateBanner(
+                          update: update,
+                          installing: _installingUpdate,
+                          onInstall: () => _installUpdate(update),
+                        ),
+                      );
+                    },
+                  );
+                }
+                return DateSectionView(section: sections[index - 1]);
               },
-              itemCount: sections.length,
             ),
           );
         },
+      ),
+    );
+  }
+}
+
+class _UpdateBanner extends StatelessWidget {
+  const _UpdateBanner({
+    required this.update,
+    required this.installing,
+    required this.onInstall,
+  });
+
+  final AppUpdateInfo update;
+  final bool installing;
+  final VoidCallback onInstall;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xff042f28),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x24042f28),
+            blurRadius: 18,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const _LogoMark(size: 44),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Update available',
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w900,
+                      ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  'Version ${update.versionName}',
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: const Color(0xff59e38b),
+                        fontWeight: FontWeight.w800,
+                      ),
+                ),
+                if (update.releaseNotes.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    update.releaseNotes,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: const Color(0xffd7eee7),
+                        ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          FilledButton.icon(
+            onPressed: installing ? null : onInstall,
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xff12b65d),
+              foregroundColor: Colors.white,
+              disabledBackgroundColor: const Color(0xffdfe6df),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+            ),
+            icon: installing
+                ? const SizedBox.square(
+                    dimension: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Color(0xff0e6656),
+                    ),
+                  )
+                : const Icon(Icons.system_update_alt_rounded, size: 18),
+            label: Text(installing ? 'Wait' : 'Update'),
+          ),
+        ],
       ),
     );
   }
@@ -602,6 +804,25 @@ class _StatusPill extends StatelessWidget {
   }
 }
 
+class _LogoMark extends StatelessWidget {
+  const _LogoMark({required this.size});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(size * 0.24),
+      child: Image.asset(
+        'assets/dhanda_logo.png',
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+      ),
+    );
+  }
+}
+
 class ScriptDetailPage extends StatefulWidget {
   const ScriptDetailPage({required this.script, super.key});
 
@@ -841,91 +1062,104 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
   Widget build(BuildContext context) {
     final canAddRecording = !_recording && _pending == null;
     return Scaffold(
-      appBar: AppBar(title: Text(widget.script.channelName)),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(14, 8, 14, 12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                widget.script.title,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context)
-                    .textTheme
-                    .titleLarge
-                    ?.copyWith(fontWeight: FontWeight.w900),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                widget.script.videoUrl,
+      backgroundColor: const Color(0xfff7f8f4),
+      appBar: AppBar(
+        titleSpacing: 0,
+        backgroundColor: const Color(0xfff7f8f4),
+        surfaceTintColor: Colors.transparent,
+        title: Row(
+          children: [
+            const _LogoMark(size: 34),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                widget.script.channelName,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodySmall,
               ),
-              const SizedBox(height: 10),
-              Expanded(
-                child: _ScriptPanel(
-                  script: widget.script.script,
-                  expanded: _scriptExpanded,
-                  onToggleExpanded: () {
-                    setState(() {
-                      _scriptExpanded = !_scriptExpanded;
-                    });
-                  },
+            ),
+          ],
+        ),
+      ),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final rawScriptHeight = _scriptExpanded
+                ? constraints.maxHeight * 0.66
+                : constraints.maxHeight * 0.42;
+            final maxScriptHeight = _scriptExpanded ? 640.0 : 410.0;
+            final scriptHeight =
+                rawScriptHeight.clamp(270.0, maxScriptHeight).toDouble();
+            return Scrollbar(
+              thumbVisibility: true,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(14, 4, 14, 28),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _DetailHero(script: widget.script),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      height: scriptHeight,
+                      child: _ScriptPanel(
+                        script: widget.script.script,
+                        expanded: _scriptExpanded,
+                        onToggleExpanded: () {
+                          setState(() {
+                            _scriptExpanded = !_scriptExpanded;
+                          });
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _ActionSurface(
+                      child: _RecordingControls(
+                        recording: _recording,
+                        paused: _paused,
+                        pending: _pending,
+                        elapsed: _recordingElapsed,
+                        waveform: _waveform,
+                        canAddRecording: canAddRecording,
+                        hasRecordings: _recordings.isNotEmpty,
+                        onStart: _start,
+                        onPauseOrResume: _pauseOrResume,
+                        onStop: _stop,
+                        onSave: _savePending,
+                        onDiscard: _discardPending,
+                      ),
+                    ),
+                    if (_recordings.isNotEmpty || _combinedLink != null) ...[
+                      const SizedBox(height: 12),
+                      CombinedUploadPanel(
+                        link: _combinedLink,
+                        busy: _uploadingCombined,
+                        progress: _uploadProgress,
+                        stage: _uploadStage,
+                        onUpload: _uploadCombined,
+                        onShare: _combinedLink == null
+                            ? null
+                            : () => _audio.share(_shareMessage(_combinedLink!)),
+                      ),
+                    ],
+                    const SizedBox(height: 14),
+                    _SectionHeading(
+                      title: 'Recordings',
+                      trailing: _recordings.isEmpty
+                          ? null
+                          : '${_recordings.length} saved',
+                    ),
+                    const SizedBox(height: 8),
+                    _RecordingsList(
+                      loading: _loading,
+                      recordings: _recordings,
+                      onPlay: (item) => _audio.play(item.path),
+                      onDelete: _delete,
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(height: 10),
-              _RecordingControls(
-                recording: _recording,
-                paused: _paused,
-                pending: _pending,
-                elapsed: _recordingElapsed,
-                waveform: _waveform,
-                canAddRecording: canAddRecording,
-                hasRecordings: _recordings.isNotEmpty,
-                onStart: _start,
-                onPauseOrResume: _pauseOrResume,
-                onStop: _stop,
-                onSave: _savePending,
-                onDiscard: _discardPending,
-              ),
-              if (_recordings.isNotEmpty || _combinedLink != null) ...[
-                const SizedBox(height: 10),
-                CombinedUploadPanel(
-                  link: _combinedLink,
-                  busy: _uploadingCombined,
-                  progress: _uploadProgress,
-                  stage: _uploadStage,
-                  onUpload: _uploadCombined,
-                  onShare: _combinedLink == null
-                      ? null
-                      : () => _audio.share(_shareMessage(_combinedLink!)),
-                ),
-              ],
-              if (!_scriptExpanded) ...[
-                const SizedBox(height: 8),
-                Text(
-                  'Recordings',
-                  style: Theme.of(context)
-                      .textTheme
-                      .titleSmall
-                      ?.copyWith(fontWeight: FontWeight.w800),
-                ),
-                const SizedBox(height: 4),
-                SizedBox(
-                  height: 94,
-                  child: _RecordingsList(
-                    loading: _loading,
-                    recordings: _recordings,
-                    onPlay: (item) => _audio.play(item.path),
-                    onDelete: _delete,
-                  ),
-                ),
-              ],
-            ],
-          ),
+            );
+          },
         ),
       ),
     );
@@ -939,6 +1173,142 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
       'Original YouTube video: ${widget.script.videoUrl}',
       'Audio download link: $audioLink',
     ].join('\n');
+  }
+}
+
+class _DetailHero extends StatelessWidget {
+  const _DetailHero({required this.script});
+
+  final VideoScript script;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xff042f28),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x1f042f28),
+            blurRadius: 18,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const _LogoMark(size: 52),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  script.title,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w900,
+                        height: 1.16,
+                      ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.play_circle_outline_rounded,
+                      color: Color(0xff59e38b),
+                      size: 18,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        script.videoUrl,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              color: const Color(0xffd7eee7),
+                              fontWeight: FontWeight.w600,
+                            ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ActionSurface extends StatelessWidget {
+  const _ActionSurface({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xffdfe6df)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x0f042f28),
+            blurRadius: 14,
+            offset: Offset(0, 6),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+}
+
+class _SectionHeading extends StatelessWidget {
+  const _SectionHeading({required this.title, this.trailing});
+
+  final String title;
+  final String? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Text(
+          title,
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w900,
+                color: const Color(0xff052f28),
+              ),
+        ),
+        if (trailing != null) ...[
+          const Spacer(),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+            decoration: BoxDecoration(
+              color: const Color(0xffe7f5ee),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              trailing!,
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: const Color(0xff0e6656),
+                    fontWeight: FontWeight.w800,
+                  ),
+            ),
+          ),
+        ],
+      ],
+    );
   }
 }
 
@@ -958,21 +1328,23 @@ class _RecordingsList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (loading) {
-      return const Center(child: CircularProgressIndicator());
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 28),
+        child: Center(child: CircularProgressIndicator()),
+      );
     }
     if (recordings.isEmpty) {
       return const _EmptyRecordings();
     }
-    return ListView.builder(
-      itemBuilder: (context, index) {
-        final item = recordings[index];
-        return RecordingTile(
-          item: item,
-          onPlay: () => onPlay(item),
-          onDelete: () => onDelete(item),
-        );
-      },
-      itemCount: recordings.length,
+    return Column(
+      children: [
+        for (final item in recordings)
+          RecordingTile(
+            item: item,
+            onPlay: () => onPlay(item),
+            onDelete: () => onDelete(item),
+          ),
+      ],
     );
   }
 }
@@ -991,11 +1363,18 @@ class _ScriptPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xffdedbd2)),
+        border: Border.all(color: const Color(0xffdfe6df)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x0f042f28),
+            blurRadius: 14,
+            offset: Offset(0, 6),
+          ),
+        ],
       ),
       child: Column(
         children: [
@@ -1004,15 +1383,19 @@ class _ScriptPanel extends StatelessWidget {
               Expanded(
                 child: Text(
                   'Script',
-                  style: Theme.of(context)
-                      .textTheme
-                      .titleSmall
-                      ?.copyWith(fontWeight: FontWeight.w800),
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w900,
+                        color: const Color(0xff052f28),
+                      ),
                 ),
               ),
               IconButton(
                 tooltip: expanded ? 'Collapse script' : 'Expand script',
                 onPressed: onToggleExpanded,
+                style: IconButton.styleFrom(
+                  backgroundColor: const Color(0xffedf8f3),
+                  foregroundColor: const Color(0xff0e6656),
+                ),
                 icon: Icon(
                   expanded
                       ? Icons.close_fullscreen_rounded
@@ -1021,7 +1404,7 @@ class _ScriptPanel extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: 6),
           Expanded(
             child: Scrollbar(
               thumbVisibility: true,
@@ -1029,10 +1412,10 @@ class _ScriptPanel extends StatelessWidget {
                 padding: const EdgeInsets.only(right: 10),
                 child: Text(
                   script,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyLarge
-                      ?.copyWith(height: 1.45),
+                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        height: 1.48,
+                        color: const Color(0xff17231f),
+                      ),
                 ),
               ),
             ),
@@ -1177,8 +1560,9 @@ class _LiveRecordingMeter extends StatelessWidget {
             _formatDuration(elapsed),
             style: Theme.of(context).textTheme.titleMedium?.copyWith(
                   fontWeight: FontWeight.w900,
-                  color:
-                      paused ? const Color(0xff8a5a00) : const Color(0xff0e6656),
+                  color: paused
+                      ? const Color(0xff8a5a00)
+                      : const Color(0xff0e6656),
                 ),
           ),
           const SizedBox(width: 12),
@@ -1273,18 +1657,32 @@ class RecordingTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      elevation: 0,
+    return Container(
       margin: const EdgeInsets.only(bottom: 10),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xffdfe6df)),
+      ),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                const Icon(Icons.graphic_eq_rounded),
+                Container(
+                  width: 38,
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: const Color(0xffedf8f3),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Icon(
+                    Icons.graphic_eq_rounded,
+                    color: Color(0xff0e6656),
+                  ),
+                ),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
@@ -1299,10 +1697,11 @@ class RecordingTile extends StatelessWidget {
                       const SizedBox(height: 2),
                       Text(
                         _formatDuration(item.duration),
-                        style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                              color: const Color(0xff0e6656),
-                              fontWeight: FontWeight.w800,
-                            ),
+                        style:
+                            Theme.of(context).textTheme.labelMedium?.copyWith(
+                                  color: const Color(0xff0e6656),
+                                  fontWeight: FontWeight.w800,
+                                ),
                       ),
                     ],
                   ),
@@ -1310,11 +1709,18 @@ class RecordingTile extends StatelessWidget {
                 IconButton(
                   tooltip: 'Play',
                   onPressed: onPlay,
+                  style: IconButton.styleFrom(
+                    backgroundColor: const Color(0xff042f28),
+                    foregroundColor: Colors.white,
+                  ),
                   icon: const Icon(Icons.play_arrow_rounded),
                 ),
                 IconButton(
                   tooltip: 'Delete',
                   onPressed: onDelete,
+                  style: IconButton.styleFrom(
+                    foregroundColor: const Color(0xff7a302d),
+                  ),
                   icon: const Icon(Icons.delete_outline_rounded),
                 ),
               ],
@@ -1350,8 +1756,15 @@ class CombinedUploadPanel extends StatelessWidget {
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: Colors.white,
-        border: Border.all(color: const Color(0xffdedbd2)),
+        border: Border.all(color: const Color(0xffdfe6df)),
         borderRadius: BorderRadius.circular(8),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x0f042f28),
+            blurRadius: 14,
+            offset: Offset(0, 6),
+          ),
+        ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1371,10 +1784,19 @@ class CombinedUploadPanel extends StatelessWidget {
               IconButton(
                 tooltip: link == null ? 'Upload stitched audio' : 'Share link',
                 onPressed: busy ? null : (link == null ? onUpload : onShare),
+                style: IconButton.styleFrom(
+                  backgroundColor: const Color(0xff042f28),
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor: const Color(0xffdfe6df),
+                  disabledForegroundColor: const Color(0xff6c7770),
+                ),
                 icon: busy
                     ? const SizedBox.square(
                         dimension: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Color(0xff0e6656),
+                        ),
                       )
                     : Icon(
                         link == null
@@ -1397,6 +1819,7 @@ class CombinedUploadPanel extends StatelessWidget {
                 minHeight: 7,
                 value: progress,
                 backgroundColor: const Color(0xffe7e2d7),
+                color: const Color(0xff12b65d),
               ),
             ),
             const SizedBox(height: 6),
@@ -1430,12 +1853,33 @@ class _EmptyRecordings extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
+      width: double.infinity,
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        border: Border.all(color: const Color(0xffdedbd2)),
+        color: Colors.white,
+        border: Border.all(color: const Color(0xffdfe6df)),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: const Text('No saved recordings for this video yet.'),
+      child: Row(
+        children: [
+          Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              color: const Color(0xffedf8f3),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: const Icon(
+              Icons.mic_none_rounded,
+              color: Color(0xff0e6656),
+            ),
+          ),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Text('No saved recordings for this video yet.'),
+          ),
+        ],
+      ),
     );
   }
 }

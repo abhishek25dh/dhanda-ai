@@ -9,6 +9,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
@@ -17,12 +18,17 @@ import android.media.MediaMuxer;
 import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.os.Build;
+import android.provider.Settings;
 
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,6 +42,7 @@ import io.flutter.embedding.android.FlutterActivity;
 import io.flutter.embedding.engine.FlutterEngine;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
+import androidx.core.content.FileProvider;
 
 public class MainActivity extends FlutterActivity {
     private static final String CHANNEL = "dhanda_ai/audio";
@@ -113,6 +120,12 @@ public class MainActivity extends FlutterActivity {
                     break;
                 case "shareText":
                     shareText(call.argument("text"), result);
+                    break;
+                case "versionCode":
+                    versionCode(result);
+                    break;
+                case "installApk":
+                    installApk(call.argument("url"), result);
                     break;
                 case "showUploadStarted":
                     showUploadStarted(call.argument("title"), result);
@@ -339,6 +352,102 @@ public class MainActivity extends FlutterActivity {
         intent.putExtra(Intent.EXTRA_TEXT, text);
         startActivity(Intent.createChooser(intent, "Share recording link"));
         result.success(null);
+    }
+
+    private void versionCode(MethodChannel.Result result) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                result.success((int) getPackageManager()
+                        .getPackageInfo(getPackageName(), 0)
+                        .getLongVersionCode());
+            } else {
+                result.success(getPackageManager()
+                        .getPackageInfo(getPackageName(), 0)
+                        .versionCode);
+            }
+        } catch (PackageManager.NameNotFoundException error) {
+            result.success(1);
+        }
+    }
+
+    private void installApk(String apkUrl, MethodChannel.Result result) {
+        if (apkUrl == null || apkUrl.trim().isEmpty()) {
+            result.error("BAD_UPDATE_URL", "Update URL is required.", null);
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && !getPackageManager().canRequestPackageInstalls()) {
+            Intent settings = new Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + getPackageName())
+            );
+            startActivity(settings);
+            result.error(
+                    "INSTALL_PERMISSION_REQUIRED",
+                    "Allow Dhanda AI to install unknown apps, then tap Update again.",
+                    null
+            );
+            return;
+        }
+
+        new Thread(() -> {
+            try {
+                File updateFolder = new File(getCacheDir(), "updates");
+                if (!updateFolder.exists() && !updateFolder.mkdirs()) {
+                    throw new IOException("Could not create update folder.");
+                }
+                File apk = new File(updateFolder, "dhanda-ai-update.apk");
+                downloadFile(apkUrl, apk);
+                runOnUiThread(() -> {
+                    try {
+                        openApkInstaller(apk);
+                        result.success(null);
+                    } catch (Exception error) {
+                        result.error("INSTALL_FAILED", error.getMessage(), null);
+                    }
+                });
+            } catch (Exception error) {
+                runOnUiThread(() ->
+                        result.error("DOWNLOAD_FAILED", error.getMessage(), null)
+                );
+            }
+        }).start();
+    }
+
+    private void downloadFile(String sourceUrl, File destination) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(sourceUrl).openConnection();
+        connection.setConnectTimeout(15000);
+        connection.setReadTimeout(60000);
+        connection.connect();
+        int status = connection.getResponseCode();
+        if (status < 200 || status >= 300) {
+            throw new IOException("Download failed with status " + status);
+        }
+        try (
+                InputStream input = connection.getInputStream();
+                FileOutputStream output = new FileOutputStream(destination)
+        ) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                output.write(buffer, 0, read);
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private void openApkInstaller(File apk) {
+        Uri uri = FileProvider.getUriForFile(
+                this,
+                getPackageName() + ".fileprovider",
+                apk
+        );
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(uri, "application/vnd.android.package-archive");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(intent);
     }
 
     private void showUploadStarted(String title, MethodChannel.Result result) {
