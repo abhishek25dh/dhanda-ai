@@ -12,6 +12,7 @@ import android.content.pm.PackageManager;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
+import android.media.MediaMetadataRetriever;
 import android.media.MediaMuxer;
 import android.media.MediaPlayer;
 import android.media.MediaRecorder;
@@ -81,6 +82,9 @@ public class MainActivity extends FlutterActivity {
                     break;
                 case "resumeRecording":
                     resumeRecording(result);
+                    break;
+                case "recordingAmplitude":
+                    recordingAmplitude(result);
                     break;
                 case "stopRecording":
                     stopRecording(result);
@@ -195,6 +199,18 @@ public class MainActivity extends FlutterActivity {
             recorder.resume();
         }
         result.success(null);
+    }
+
+    private void recordingAmplitude(MethodChannel.Result result) {
+        if (recorder == null) {
+            result.success(0);
+            return;
+        }
+        try {
+            result.success(recorder.getMaxAmplitude());
+        } catch (RuntimeException error) {
+            result.success(0);
+        }
     }
 
     private void stopRecording(MethodChannel.Result result) {
@@ -409,11 +425,34 @@ public class MainActivity extends FlutterActivity {
         payload.put("id", videoId + ":" + file.getName());
         payload.put("path", file.getAbsolutePath());
         payload.put("createdAt", file.lastModified());
+        payload.put("durationMs", durationMs(file));
         String link = readLinks().optString(file.getAbsolutePath(), null);
         if (link != null && !link.isEmpty()) {
             payload.put("downloadUrl", link);
         }
         return payload;
+    }
+
+    private long durationMs(File file) {
+        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+        try {
+            retriever.setDataSource(file.getAbsolutePath());
+            String raw = retriever.extractMetadata(
+                    MediaMetadataRetriever.METADATA_KEY_DURATION
+            );
+            if (raw == null || raw.isEmpty()) {
+                return 0L;
+            }
+            return Long.parseLong(raw);
+        } catch (Exception error) {
+            return 0L;
+        } finally {
+            try {
+                retriever.release();
+            } catch (IOException ignored) {
+                // Nothing to clean up.
+            }
+        }
     }
 
     private void removeLink(String path) {

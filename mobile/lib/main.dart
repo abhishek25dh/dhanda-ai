@@ -102,6 +102,10 @@ class NativeAudioStore {
     return _channel.invokeMethod('resumeRecording');
   }
 
+  Future<int> amplitude() async {
+    return await _channel.invokeMethod<int>('recordingAmplitude') ?? 0;
+  }
+
   Future<RecordingItem> stop(String videoId) async {
     final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
       'stopRecording',
@@ -225,6 +229,7 @@ class RecordingItem {
     required this.id,
     required this.path,
     required this.createdAt,
+    required this.duration,
     this.downloadUrl,
   });
 
@@ -237,6 +242,7 @@ class RecordingItem {
       createdAt: DateTime.fromMillisecondsSinceEpoch(
         native['createdAt'] as int? ?? DateTime.now().millisecondsSinceEpoch,
       ),
+      duration: Duration(milliseconds: native['durationMs'] as int? ?? 0),
       downloadUrl: native['downloadUrl'] as String?,
     );
   }
@@ -244,6 +250,7 @@ class RecordingItem {
   final String id;
   final String path;
   final DateTime createdAt;
+  final Duration duration;
   final String? downloadUrl;
 }
 
@@ -618,11 +625,21 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
   String? _uploadStage;
   int _lastUploadNotificationProgress = -1;
   String? _combinedLink;
+  final Stopwatch _recordingWatch = Stopwatch();
+  Timer? _recordingTicker;
+  Duration _recordingElapsed = Duration.zero;
+  List<double> _waveform = List<double>.filled(24, 0.08);
 
   @override
   void initState() {
     super.initState();
     _loadRecordings();
+  }
+
+  @override
+  void dispose() {
+    _recordingTicker?.cancel();
+    super.dispose();
   }
 
   Future<void> _loadRecordings() async {
@@ -641,10 +658,16 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
   Future<void> _start() async {
     try {
       await _audio.start(widget.script.id);
+      _recordingWatch
+        ..reset()
+        ..start();
+      _startRecordingTicker();
       setState(() {
         _recording = true;
         _paused = false;
         _pending = null;
+        _recordingElapsed = Duration.zero;
+        _waveform = List<double>.filled(24, 0.08);
       });
     } catch (error) {
       if (mounted) {
@@ -658,8 +681,10 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
   Future<void> _pauseOrResume() async {
     if (_paused) {
       await _audio.resume();
+      _recordingWatch.start();
     } else {
       await _audio.pause();
+      _recordingWatch.stop();
     }
     setState(() {
       _paused = !_paused;
@@ -668,10 +693,37 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
 
   Future<void> _stop() async {
     final item = await _audio.stop(widget.script.id);
+    _recordingWatch.stop();
+    _recordingTicker?.cancel();
     setState(() {
       _pending = item;
       _recording = false;
       _paused = false;
+      _recordingElapsed = _recordingWatch.elapsed;
+      _waveform = List<double>.filled(24, 0.08);
+    });
+  }
+
+  void _startRecordingTicker() {
+    _recordingTicker?.cancel();
+    _recordingTicker = Timer.periodic(const Duration(milliseconds: 120), (_) {
+      _tickRecordingMeter();
+    });
+  }
+
+  Future<void> _tickRecordingMeter() async {
+    if (!_recording || !mounted) {
+      return;
+    }
+    final rawAmplitude = _paused ? 0 : await _audio.amplitude();
+    if (!_recording || !mounted) {
+      return;
+    }
+    final normalized = (rawAmplitude / 32767).clamp(0.02, 1).toDouble();
+    final shaped = _paused ? 0.06 : (0.08 + normalized * 0.92);
+    setState(() {
+      _recordingElapsed = _recordingWatch.elapsed;
+      _waveform = <double>[..._waveform.skip(1), shaped];
     });
   }
 
@@ -829,6 +881,8 @@ class _ScriptDetailPageState extends State<ScriptDetailPage> {
                 recording: _recording,
                 paused: _paused,
                 pending: _pending,
+                elapsed: _recordingElapsed,
+                waveform: _waveform,
                 canAddRecording: canAddRecording,
                 hasRecordings: _recordings.isNotEmpty,
                 onStart: _start,
@@ -994,6 +1048,8 @@ class _RecordingControls extends StatelessWidget {
     required this.recording,
     required this.paused,
     required this.pending,
+    required this.elapsed,
+    required this.waveform,
     required this.canAddRecording,
     required this.hasRecordings,
     required this.onStart,
@@ -1006,6 +1062,8 @@ class _RecordingControls extends StatelessWidget {
   final bool recording;
   final bool paused;
   final RecordingItem? pending;
+  final Duration elapsed;
+  final List<double> waveform;
   final bool canAddRecording;
   final bool hasRecordings;
   final VoidCallback onStart;
@@ -1017,45 +1075,61 @@ class _RecordingControls extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (pending != null) {
-      return Row(
+      return Column(
         children: [
-          Expanded(
-            child: FilledButton.icon(
-              onPressed: onSave,
-              icon: const Icon(Icons.save_alt_rounded),
-              label: const Text('Save'),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: OutlinedButton.icon(
-              onPressed: onDiscard,
-              icon: const Icon(Icons.delete_outline_rounded),
-              label: const Text('Discard'),
-            ),
+          _PendingRecordingSummary(item: pending!),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: onSave,
+                  icon: const Icon(Icons.save_alt_rounded),
+                  label: const Text('Save'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: onDiscard,
+                  icon: const Icon(Icons.delete_outline_rounded),
+                  label: const Text('Discard'),
+                ),
+              ),
+            ],
           ),
         ],
       );
     }
     if (recording) {
-      return Row(
+      return Column(
         children: [
-          Expanded(
-            child: FilledButton.icon(
-              onPressed: onPauseOrResume,
-              icon: Icon(
-                paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
-              ),
-              label: Text(paused ? 'Resume' : 'Pause'),
-            ),
+          _LiveRecordingMeter(
+            elapsed: elapsed,
+            waveform: waveform,
+            paused: paused,
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: FilledButton.tonalIcon(
-              onPressed: onStop,
-              icon: const Icon(Icons.stop_rounded),
-              label: const Text('Stop'),
-            ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: onPauseOrResume,
+                  icon: Icon(
+                    paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                  ),
+                  label: Text(paused ? 'Resume' : 'Pause'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: onStop,
+                  icon: const Icon(Icons.stop_rounded),
+                  label: const Text('Stop'),
+                ),
+              ),
+            ],
           ),
         ],
       );
@@ -1066,6 +1140,121 @@ class _RecordingControls extends StatelessWidget {
         hasRecordings ? Icons.add_circle_outline_rounded : Icons.mic_rounded,
       ),
       label: Text(hasRecordings ? 'Add recording' : 'Record'),
+    );
+  }
+}
+
+class _LiveRecordingMeter extends StatelessWidget {
+  const _LiveRecordingMeter({
+    required this.elapsed,
+    required this.waveform,
+    required this.paused,
+  });
+
+  final Duration elapsed;
+  final List<double> waveform;
+  final bool paused;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: paused ? const Color(0xfffff7e8) : const Color(0xffedf8f3),
+        border: Border.all(
+          color: paused ? const Color(0xffffd895) : const Color(0xffb8e2d1),
+        ),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            paused ? Icons.pause_circle_outline_rounded : Icons.mic_rounded,
+            color: paused ? const Color(0xff8a5a00) : const Color(0xff0e6656),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            _formatDuration(elapsed),
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w900,
+                  color:
+                      paused ? const Color(0xff8a5a00) : const Color(0xff0e6656),
+                ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: SizedBox(
+              height: 36,
+              child: _WaveformBars(values: waveform, paused: paused),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PendingRecordingSummary extends StatelessWidget {
+  const _PendingRecordingSummary({required this.item});
+
+  final RecordingItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xfff1f7ff),
+        border: Border.all(color: const Color(0xffc8dcf6)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.audiotrack_rounded, color: Color(0xff245ea8)),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Recorded ${_formatDuration(item.duration)}',
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: const Color(0xff245ea8),
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WaveformBars extends StatelessWidget {
+  const _WaveformBars({required this.values, required this.paused});
+
+  final List<double> values;
+  final bool paused;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = paused ? const Color(0xffc5851c) : const Color(0xff0e7c66);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: values.map((value) {
+        final heightFactor = value.clamp(0.06, 1).toDouble();
+        return Expanded(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 1.5),
+            child: FractionallySizedBox(
+              heightFactor: heightFactor,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(999),
+                ),
+              ),
+            ),
+          ),
+        );
+      }).toList(),
     );
   }
 }
@@ -1098,9 +1287,24 @@ class RecordingTile extends StatelessWidget {
                 const Icon(Icons.graphic_eq_rounded),
                 const SizedBox(width: 10),
                 Expanded(
-                  child: Text(
-                    _formatDateTime(item.createdAt),
-                    style: Theme.of(context).textTheme.titleSmall,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _formatDateTime(item.createdAt),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleSmall,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        _formatDuration(item.duration),
+                        style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                              color: const Color(0xff0e6656),
+                              fontWeight: FontWeight.w800,
+                            ),
+                      ),
+                    ],
                   ),
                 ),
                 IconButton(
@@ -1254,6 +1458,19 @@ String _formatDateTime(DateTime value) {
   final hour = value.hour.toString().padLeft(2, '0');
   final minute = value.minute.toString().padLeft(2, '0');
   return '${_formatDate(value)} at $hour:$minute';
+}
+
+String _formatDuration(Duration value) {
+  final totalSeconds = value.inSeconds;
+  final minutes = (totalSeconds ~/ 60).toString().padLeft(2, '0');
+  final seconds = (totalSeconds % 60).toString().padLeft(2, '0');
+  if (value.inHours > 0) {
+    final hours = value.inHours.toString().padLeft(2, '0');
+    final remainingMinutes =
+        ((totalSeconds % 3600) ~/ 60).toString().padLeft(2, '0');
+    return '$hours:$remainingMinutes:$seconds';
+  }
+  return '$minutes:$seconds';
 }
 
 String _ordinal(int day) {
