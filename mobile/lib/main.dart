@@ -1741,6 +1741,23 @@ class _ScriptPanel extends StatelessWidget {
                 ),
               ),
               IconButton(
+                tooltip: 'Copy script',
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: script));
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Script copied')),
+                    );
+                  }
+                },
+                style: IconButton.styleFrom(
+                  backgroundColor: const Color(0xffedf8f3),
+                  foregroundColor: const Color(0xff0e6656),
+                ),
+                icon: const Icon(Icons.copy_rounded),
+              ),
+              const SizedBox(width: 6),
+              IconButton(
                 tooltip: expanded ? 'Collapse script' : 'Expand script',
                 onPressed: onToggleExpanded,
                 style: IconButton.styleFrom(
