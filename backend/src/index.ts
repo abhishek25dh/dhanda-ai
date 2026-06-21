@@ -9,6 +9,7 @@ interface Env {
   APP_VERSION_NAME?: string;
   APP_RELEASE_NOTES?: string;
   APP_APK_KEY?: string;
+  APP_APK_URL?: string;
 }
 
 type ChannelConfig = {
@@ -146,7 +147,7 @@ async function getLatestApp(env: Env, url: URL): Promise<Response> {
     platform: 'android',
     versionCode: Number.isFinite(versionCode) ? versionCode : 1,
     versionName: env.APP_VERSION_NAME ?? '0.1.0',
-    apkUrl: `${url.origin}/app/apk`,
+    apkUrl: env.APP_APK_URL ?? `${url.origin}/app/apk`,
     releaseNotes:
       env.APP_RELEASE_NOTES ??
       'New Dhanda AI build is available with UI and recording improvements.',

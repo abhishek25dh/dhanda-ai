@@ -8,10 +8,11 @@
   },
   "vars": {
     "OPENROUTER_MODEL": "openai/gpt-oss-120b:free",
-    "APP_VERSION_CODE": "4",
-    "APP_VERSION_NAME": "0.1.3",
-    "APP_RELEASE_NOTES": "Instant cached cards, graceful refresh, download progress, install-ready updates, and audio link history.",
-    "APP_APK_KEY": "app/dhanda-ai.apk"
+    "APP_VERSION_CODE": "5",
+    "APP_VERSION_NAME": "0.1.4",
+    "APP_RELEASE_NOTES": "Small release APK, instant cached cards, graceful refresh, download progress, and install-ready updates.",
+    "APP_APK_KEY": "app/dhanda-ai.apk",
+    "APP_APK_URL": "https://github.com/abhishek25dh/dhanda-ai/releases/download/v0.1.4/app-arm64-v8a-release.apk"
   },
   "d1_databases": [
     {
