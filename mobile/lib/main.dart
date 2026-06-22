@@ -48,6 +48,7 @@ class ApiClient {
       final items = decoded['items'] as List<dynamic>? ?? <dynamic>[];
       return items
           .map((item) => VideoScript.fromJson(item as Map<String, dynamic>))
+          .where((script) => script.isReady)
           .toList();
     } catch (_) {
       return sampleScripts;
@@ -273,6 +274,7 @@ class VideoScript {
     required this.videoUrl,
     required this.publishedAt,
     required this.script,
+    required this.status,
   });
 
   factory VideoScript.fromJson(Map<String, dynamic> json) {
@@ -284,6 +286,7 @@ class VideoScript {
       publishedAt: DateTime.tryParse(json['publishedAt'] as String? ?? '') ??
           DateTime.now(),
       script: json['script'] as String? ?? '',
+      status: json['status'] as String? ?? 'ready',
     );
   }
 
@@ -293,6 +296,12 @@ class VideoScript {
   final String videoUrl;
   final DateTime publishedAt;
   final String script;
+  final String status;
+
+  bool get isReady =>
+      status == 'ready' &&
+      script.trim().isNotEmpty &&
+      !script.startsWith('Script is being prepared');
 }
 
 class AppUpdateInfo {
@@ -481,6 +490,7 @@ class _ScriptFeedPageState extends State<ScriptFeedPage> {
     final items = decoded['items'] as List<dynamic>? ?? <dynamic>[];
     return items
         .map((item) => VideoScript.fromJson(item as Map<String, dynamic>))
+        .where((script) => script.isReady)
         .toList();
   }
 
@@ -2404,6 +2414,7 @@ final List<VideoScript> sampleScripts = <VideoScript>[
     title: 'Latest business update rewritten for Dhanda AI',
     videoUrl: 'https://www.youtube.com/watch?v=sample',
     publishedAt: DateTime(2026, 6, 21),
+    status: 'ready',
     script:
         'Namaste dosto. Aaj hum baat karenge ek practical business idea ke baare mein. Pehle problem ko simple language mein samjho, phir uska solution explain karo, aur end mein audience ko ek clear action do. Yeh script server se ready aayegi, taki app khulte hi recording start ho sake.',
   ),

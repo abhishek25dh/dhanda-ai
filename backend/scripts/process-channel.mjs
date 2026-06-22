@@ -44,44 +44,49 @@ const readyVideoIds = await fetchReadyVideoIds();
 for (const channel of channels) {
   const videos = await latestVideos(channel);
   for (const video of videos.filter((item) => shouldProcess(channel, item))) {
-    if (!forceRewrite && readyVideoIds.has(video.id)) {
-      console.log(`skipped ${video.id}; server already has a ready script`);
-      continue;
-    }
+    try {
+      if (!forceRewrite && readyVideoIds.has(video.id)) {
+        console.log(`skipped ${video.id}; server already has a ready script`);
+        continue;
+      }
 
-    const outputPath = join(runDir, `${video.id}.json`);
-    if (await fileExists(outputPath)) {
-      const payload = await ensureRewrite(
-        JSON.parse(await readFile(outputPath, 'utf8')),
-        outputPath,
-      );
+      const outputPath = join(runDir, `${video.id}.json`);
+      if (await fileExists(outputPath)) {
+        const payload = await ensureRewrite(
+          JSON.parse(await readFile(outputPath, 'utf8')),
+          outputPath,
+        );
+        if (apiBase && adminKey) {
+          await postJson(`${apiBase.replace(/\/$/, '')}/admin/videos/upsert`, payload);
+          console.log(`uploaded existing ${video.id}`);
+        } else {
+          console.log(`skipped ${video.id}; local transcript JSON already exists`);
+        }
+        continue;
+      }
+
+      const transcript = await assemblyAiTranscript(video.id);
+      const payload = {
+        id: video.id,
+        channelId: channel.channelId,
+        channelName: channel.channelName,
+        title: video.title,
+        videoUrl: video.url,
+        publishedAt: video.publishedAt,
+        transcript: transcript.text,
+        transcriptSource: transcript.source,
+      };
+      await ensureRewrite(payload, outputPath);
+
       if (apiBase && adminKey) {
         await postJson(`${apiBase.replace(/\/$/, '')}/admin/videos/upsert`, payload);
-        console.log(`uploaded existing ${video.id}`);
-      } else {
-        console.log(`skipped ${video.id}; local transcript JSON already exists`);
       }
-      continue;
+
+      console.log(`processed ${video.id} via ${transcript.source}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`failed ${video.id}: ${message}`);
     }
-
-    const transcript = await assemblyAiTranscript(video.id);
-    const payload = {
-      id: video.id,
-      channelId: channel.channelId,
-      channelName: channel.channelName,
-      title: video.title,
-      videoUrl: video.url,
-      publishedAt: video.publishedAt,
-      transcript: transcript.text,
-      transcriptSource: transcript.source,
-    };
-    await ensureRewrite(payload, outputPath);
-
-    if (apiBase && adminKey) {
-      await postJson(`${apiBase.replace(/\/$/, '')}/admin/videos/upsert`, payload);
-    }
-
-    console.log(`processed ${video.id} via ${transcript.source}`);
   }
 }
 

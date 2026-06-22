@@ -113,7 +113,7 @@ async function getLatestScripts(env: Env): Promise<Response> {
   const { results } = await env.DB.prepare(
     `SELECT id, channel_name, title, video_url, published_at, rewritten_script, status
      FROM video_scripts
-     WHERE status IN ('ready', 'processing', 'pending')
+     WHERE status = 'ready'
      ORDER BY published_at DESC
      LIMIT 30`,
   ).all<{
