@@ -3,7 +3,7 @@ name: Process YouTube scripts
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17,47 * * * *"
+    - cron: "*/15 * * * *"
 
 jobs:
   process:
@@ -20,6 +20,11 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: backend/package-lock.json
+
+      - name: Set up Deno for yt-dlp
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
 
       - name: Install backend dependencies
         working-directory: backend
@@ -39,4 +44,5 @@ jobs:
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
           DHANDA_API_BASE: ${{ vars.DHANDA_API_BASE }}
           DHANDA_ADMIN_API_KEY: ${{ secrets.DHANDA_ADMIN_API_KEY }}
+          TRANSCRIPT_MODE: captions
         run: npm run process:channel

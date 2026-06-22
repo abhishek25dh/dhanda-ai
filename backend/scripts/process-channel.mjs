@@ -3,7 +3,10 @@ import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { rewriteTranscriptWithOpenRouter } from './rewrite-utils.mjs';
+import {
+  defaultRewriteModels,
+  rewriteTranscriptWithOpenRouter,
+} from './rewrite-utils.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -35,7 +38,12 @@ const adminKey = process.env.DHANDA_ADMIN_API_KEY;
 const openRouterKey = process.env.OPENROUTER_API_KEY;
 const rewriteModel =
   process.env.OPENROUTER_MODEL ?? 'qwen/qwen3-next-80b-a3b-instruct:free';
+const rewriteModels = [
+  rewriteModel,
+  ...defaultRewriteModels.filter((model) => model !== rewriteModel),
+];
 const forceRewrite = process.env.FORCE_REWRITE === '1';
+const transcriptMode = process.env.TRANSCRIPT_MODE ?? 'assemblyai';
 
 await mkdir(runDir, { recursive: true });
 
@@ -65,7 +73,7 @@ for (const channel of channels) {
         continue;
       }
 
-      const transcript = await assemblyAiTranscript(video.id);
+      const transcript = await fetchTranscript(video.id);
       const payload = {
         id: video.id,
         channelId: channel.channelId,
@@ -128,16 +136,29 @@ async function ensureRewrite(payload, outputPath) {
     return payload;
   }
 
-  console.log(`rewriting ${payload.id} with ${rewriteModel}`);
-  payload.rewrittenScript = await rewriteTranscriptWithOpenRouter({
-    apiKey: openRouterKey,
-    model: rewriteModel,
-    title: payload.title,
-    transcript: payload.transcript,
-    targetChars: 10000,
-    maxTargetChars: 14000,
-  });
-  payload.rewriteModel = rewriteModel;
+  let lastError;
+  for (const model of rewriteModels) {
+    try {
+      console.log(`rewriting ${payload.id} with ${model}`);
+      payload.rewrittenScript = await rewriteTranscriptWithOpenRouter({
+        apiKey: openRouterKey,
+        model,
+        title: payload.title,
+        transcript: payload.transcript,
+        targetChars: 10000,
+        maxTargetChars: 14000,
+      });
+      payload.rewriteModel = model;
+      break;
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`rewrite failed for ${payload.id} with ${model}: ${message}`);
+    }
+  }
+  if (!payload.rewrittenScript) {
+    throw lastError ?? new Error(`Rewrite failed for ${payload.id}`);
+  }
   payload.rewrittenAt = new Date().toISOString();
   await writeFile(outputPath, JSON.stringify(payload, null, 2), 'utf8');
   return payload;
@@ -180,6 +201,45 @@ function shouldProcess(channel, video) {
     return true;
   }
   return Date.parse(video.publishedAt) >= Date.parse(channel.includePublishedAfter);
+}
+
+async function fetchTranscript(videoId) {
+  if (transcriptMode === 'captions') {
+    return youtubeCaptionTranscript(videoId);
+  }
+  if (transcriptMode === 'assemblyai') {
+    return assemblyAiTranscript(videoId);
+  }
+  throw new Error(`Unsupported TRANSCRIPT_MODE: ${transcriptMode}`);
+}
+
+async function youtubeCaptionTranscript(videoId) {
+  await execFileAsync(
+    'yt-dlp',
+    [
+      '--skip-download',
+      '--write-auto-subs',
+      '--sub-langs',
+      'mr',
+      '--convert-subs',
+      'vtt',
+      '-o',
+      join(runDir, `${videoId}.%(ext)s`),
+      `https://www.youtube.com/watch?v=${videoId}`,
+    ],
+    { maxBuffer: 32 * 1024 * 1024 },
+  );
+
+  const captionPath = await existingCaptionPath(videoId);
+  if (!captionPath) {
+    throw new Error(`No YouTube captions found for ${videoId}`);
+  }
+
+  const text = parseVtt(await readFile(captionPath, 'utf8'));
+  if (text.length < 1000) {
+    throw new Error(`Caption transcript is too short for ${videoId}: ${text.length}`);
+  }
+  return { text, source: `youtube-captions:${captionPath.split(/[\\/]/).pop()}` };
 }
 
 async function assemblyAiTranscript(videoId) {
@@ -253,6 +313,31 @@ async function assemblyAiTranscript(videoId) {
   throw new Error('AssemblyAI transcription timed out');
 }
 
+async function existingCaptionPath(videoId) {
+  const entries = await readdir(runDir);
+  const candidates = entries
+    .filter((entry) => entry.startsWith(`${videoId}.`) && entry.endsWith('.vtt'))
+    .sort((left, right) => captionPreference(left) - captionPreference(right));
+  for (const candidate of candidates) {
+    const fullPath = join(runDir, candidate);
+    const info = await stat(fullPath);
+    if (info.size > 1024) {
+      return fullPath;
+    }
+  }
+  return null;
+}
+
+function captionPreference(fileName) {
+  if (fileName.endsWith('.mr.vtt')) {
+    return 0;
+  }
+  if (fileName.endsWith('.en.vtt')) {
+    return 1;
+  }
+  return 2;
+}
+
 async function existingAudioPath(videoId) {
   const entries = await readdir(runDir);
   const candidates = entries.filter(
@@ -279,6 +364,50 @@ function audioPreference(fileName) {
     return 1;
   }
   return 2;
+}
+
+function parseVtt(content) {
+  const seen = new Set();
+  const lines = [];
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    let line = rawLine.trim();
+    if (
+      !line ||
+      line === 'WEBVTT' ||
+      line.startsWith('Kind:') ||
+      line.startsWith('Language:') ||
+      line.includes('-->') ||
+      /^\d+$/.test(line)
+    ) {
+      continue;
+    }
+
+    line = decodeHtmlEntities(
+      line
+        .replace(/<[^>]*>/g, '')
+        .replace(/\{[^}]*\}/g, '')
+        .replace(/\s+/g, ' ')
+        .trim(),
+    );
+    if (!line || seen.has(line)) {
+      continue;
+    }
+    seen.add(line);
+    lines.push(line);
+  }
+
+  return lines.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function decodeHtmlEntities(value) {
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
 }
 
 async function postJson(url, payload) {

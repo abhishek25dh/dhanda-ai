@@ -10,6 +10,7 @@ mobile/android/local.properties
 backend/node_modules/
 backend/dist/
 backend/.wrangler/
+.wrangler/
 runs/
 *.log
 .env
